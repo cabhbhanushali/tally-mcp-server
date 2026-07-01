@@ -47,7 +47,16 @@ export async function cacheTable(lstColumnMetadata, data) {
                         return typeof value === 'boolean' ? value : null;
                     }
                     else if (colType === 'date') {
-                        return value instanceof Date ? value : null;
+                        // Insert as a bare local YYYY-MM-DD string so PGlite does not apply a
+                        // timezone shift (a local-midnight Date converts to the previous day in UTC
+                        // for timezones ahead of UTC e.g. IST, which would move every date back a day)
+                        if (value instanceof Date) {
+                            const y = value.getFullYear();
+                            const mo = String(value.getMonth() + 1).padStart(2, '0');
+                            const d = String(value.getDate()).padStart(2, '0');
+                            return `${y}-${mo}-${d}`;
+                        }
+                        return null;
                     }
                     else {
                         return value || '';

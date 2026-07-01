@@ -1,0 +1,19 @@
+<ENVELOPE>
+    <HEADER><VERSION>1</VERSION><TALLYREQUEST>Import</TALLYREQUEST><TYPE>Data</TYPE><ID>Vouchers</ID></HEADER>
+    <BODY><DESC><STATICVARIABLES><SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        {% if targetCompany %}<SVCURRENTCOMPANY>{{ targetCompany | escape }}</SVCURRENTCOMPANY>{% endif %}
+    </STATICVARIABLES></DESC><DATA>
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+            <VOUCHER REMOTEID="{{ remoteId | escape }}" VCHTYPE="{{ voucherType | escape }}" ACTION="Create" OBJVIEW="Accounting Voucher View">
+                <DATE>{{ date | formatDate("yyyyMMdd") }}</DATE>
+                <EFFECTIVEDATE>{{ date | formatDate("yyyyMMdd") }}</EFFECTIVEDATE>
+                <VOUCHERTYPENAME>{{ voucherType | escape }}</VOUCHERTYPENAME>
+                {% if voucherNumber %}<VOUCHERNUMBER>{{ voucherNumber | escape }}</VOUCHERNUMBER>{% endif %}
+                {% if partyLedger %}<PARTYLEDGERNAME>{{ partyLedger | escape }}</PARTYLEDGERNAME>{% endif %}
+                {% if reference %}<REFERENCE>{{ reference | escape }}</REFERENCE>{% endif %}
+                {% if narration %}<NARRATION>{{ narration | escape }}</NARRATION>{% endif %}
+                {% for e in entries %}<ALLLEDGERENTRIES.LIST><LEDGERNAME>{{ e.ledger | escape }}</LEDGERNAME><ISDEEMEDPOSITIVE>{{ "Yes" if e.isDebit else "No" }}</ISDEEMEDPOSITIVE><AMOUNT>{{ e.amount }}</AMOUNT></ALLLEDGERENTRIES.LIST>{% endfor %}
+            </VOUCHER>
+        </TALLYMESSAGE>
+    </DATA></BODY>
+</ENVELOPE>

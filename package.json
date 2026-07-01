@@ -5,6 +5,9 @@
   "type": "module",
   "main": "dist/server.mjs",
   "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.mjs",
+    "start:http": "node dist/server.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -29,6 +32,7 @@
     "@types/emscripten": "^1.41.5",
     "@types/express": "^5.0.6",
     "@types/node": "^25.8.0",
-    "@types/nunjucks": "^3.2.6"
+    "@types/nunjucks": "^3.2.6",
+    "typescript": "^5.9.3"
   }
 }

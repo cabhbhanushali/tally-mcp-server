@@ -167,6 +167,74 @@ export async function importMasters(targetMaster, objMasterInput) {
         throw err;
     }
 }
+/* Voucher create / delete use the Import + TYPE Data + ID Vouchers envelope which returns an
+ * <IMPORTRESULT> block (unlike master import which returns <RESPONSE>). Parse it here. */
+export async function importVouchers(templateKey, objInput) {
+    const status = {
+        created: 0, altered: 0, deleted: 0, ignored: 0, errors: 0, exceptions: 0, lineErrors: [], raw: ''
+    };
+    try {
+        const xmlTemplate = lstPushXml.get(templateKey) || '';
+        if (!xmlTemplate) {
+            status.errors = 1;
+            status.lineErrors.push(`Unknown push template: ${templateKey}`);
+            return status;
+        }
+        const raw = await sendTallyXml(xmlTemplate, objInput);
+        status.raw = raw;
+        if (!raw) {
+            status.errors = 1;
+            status.lineErrors.push('Empty response from Tally');
+            return status;
+        }
+        // A bare <RESPONSE>...</RESPONSE> here indicates a rejected request (e.g. "Unknown Request")
+        const respOnly = raw.match(/^\s*<RESPONSE>([\s\S]*?)<\/RESPONSE>\s*$/);
+        if (respOnly) {
+            status.exceptions = 1;
+            status.lineErrors.push(utility.String.unescapeHTML(respOnly[1].trim()));
+            return status;
+        }
+        if (raw.startsWith('<EXCEPTION>')) {
+            status.exceptions = 1;
+            const em = raw.match(/<EXCEPTION>(.+?)<\/EXCEPTION>/);
+            status.lineErrors.push(em ? em[1].trim() : 'Tally exception');
+            return status;
+        }
+        const numOf = (tag) => {
+            const mm = raw.match(new RegExp(`<${tag}>\\s*(-?\\d+)\\s*</${tag}>`, 'i'));
+            return mm ? parseInt(mm[1], 10) : 0;
+        };
+        status.created = numOf('CREATED');
+        status.altered = numOf('ALTERED');
+        status.deleted = numOf('DELETED');
+        status.ignored = numOf('IGNORED');
+        status.errors = numOf('ERRORS');
+        status.exceptions = numOf('EXCEPTIONS');
+        const leMatches = raw.match(/<LINEERROR>([\s\S]*?)<\/LINEERROR>/gi);
+        if (leMatches) {
+            for (const le of leMatches) {
+                const txt = le.replace(/<\/?LINEERROR>/gi, '').trim();
+                if (txt)
+                    status.lineErrors.push(utility.String.unescapeHTML(txt));
+            }
+        }
+        return status;
+    }
+    catch (err) {
+        status.errors = 1;
+        status.lineErrors.push(err instanceof Error ? err.message : (typeof err === 'string' ? err : 'Voucher import failed'));
+        return status;
+    }
+}
+/* Renders a push template to its final XML WITHOUT posting to Tally — used for write dry-runs. */
+export function renderPushTemplate(templateKey, objInput) {
+    const xmlTemplate = lstPushXml.get(templateKey) || '';
+    if (!xmlTemplate)
+        return `<!-- unknown push template: ${templateKey} -->`;
+    let o = {};
+    objInput.forEach((v, k) => { o[k] = v; });
+    return nEnv.renderString(xmlTemplate, o);
+}
 async function sendTallyXml(xml, lstVariables) {
     try {
         // remove targetCompany from lstVariables if found with default value

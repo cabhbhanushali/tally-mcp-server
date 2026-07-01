@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import dotenv from 'dotenv';
-import { fetchReport, importMasters, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
+import { fetchReport, importMasters, importVouchers, renderPushTemplate, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
 import { cacheTable, executeSQL } from './database.mjs';
 import { lstCollectionFields, lstOptionCountryState } from './definition.mjs';
 import { utility } from './utility.mjs';
@@ -851,6 +852,213 @@ export async function registerMcpServer(): Promise<McpServer> {
         return {
           isError: true, content: [{ type: 'text', text: JSON.stringify(err) }]
         };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'company-info',
+    {
+      title: 'Company Info',
+      description: `returns basic information of the open company/companies in Tally with fields company_name, financial_year_start, financial_year_end, state, country, email. Useful to establish the correct financial year and reporting context before running dated reports. returns JSON array of objects`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. skip for default active company. validate using list-master / metadata with collection Company')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let raw = await queryCollection('Company', ['Name', 'BooksFrom', 'StateName', 'CountryName', 'Email'], new Map<string, string>(), args.targetCompany);
+        let result = raw.map((r: any) => {
+          const s = r.BooksFrom;
+          let fyStart: string | null = null, fyEnd: string | null = null;
+          if (s instanceof Date) {
+            fyStart = utility.Date.format(s, 'yyyy-MM-dd');
+            const e = new Date(s.getFullYear() + 1, s.getMonth(), s.getDate());
+            e.setDate(e.getDate() - 1);
+            fyEnd = utility.Date.format(e, 'yyyy-MM-dd');
+          }
+          return { company_name: r.Name, financial_year_start: fyStart, financial_year_end: fyEnd, state: r.StateName, country: r.CountryName, email: r.Email };
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'day-book',
+    {
+      title: 'Day Book',
+      description: `fetches the Day Book / voucher register (voucher level, one row per voucher) for the given period with fields date, voucher_type, voucher_number, party_ledger, amount, narration. amount = debit is negative and credit is positive (party/primary amount). Order, cancelled and optional vouchers are excluded. Pass voucherType to restrict to one type (e.g. Sales, Purchase, Payment, Receipt, Journal); skip for all. This is the most efficient way to pull a whole month of transactions in one call. For ledger-entry level detail use voucher-register. Result cached in in-memory table (tableID). Use query-database to run SQL against it`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period start date YYYY-MM-DD'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period end date YYYY-MM-DD'),
+        voucherType: z.string().optional().describe('optional exact voucher type to filter by (e.g. Sales, Payment, Journal). validate using metadata/list-master. skip for all')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let inputParams = new Map<string, any>([
+          ['fromDate', args.fromDate],
+          ['toDate', args.toDate],
+          ['voucherType', args.voucherType || '']
+        ]);
+        if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+        const resp = await fetchReport('day-book', inputParams);
+        if (resp.error)
+          return { isError: true, content: [{ type: 'text', text: resp.error }] };
+        let tableID = await cacheTable(new Map<string, string>([['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'], ['party_ledger', 'string'], ['amount', 'amount'], ['narration', 'string']]), resp.data);
+        return { content: [{ type: 'text', text: JSON.stringify({ tableID }) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'voucher-register',
+    {
+      title: 'Voucher Register',
+      description: `fetches the accounting register at LEDGER-ENTRY level (one row per debit/credit line of every voucher) for the given period with fields date, voucher_type, voucher_number, party_ledger, place_of_supply, ledger_name, ledger_group, amount, dr_cr, narration. amount = debit negative / credit positive; ledger_group is the group of ledger_name (e.g. Sundry Debtors, Sales Accounts, Duties & Taxes) so tax lines and taxable lines can be separated. Two uses: (1) pass voucherNumber (with voucherType) to DRILL a single voucher into all its ledger lines; (2) skip voucherNumber to pull a full period register for reconciliation or GST outward working (filter voucherType=Sales/Credit Note then group by place_of_supply + ledger_group in query-database). Order/cancelled/optional vouchers excluded. Result cached in in-memory table (tableID); use query-database against it`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period start date YYYY-MM-DD'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period end date YYYY-MM-DD'),
+        voucherType: z.string().optional().describe('optional exact voucher type to filter by. skip for all'),
+        voucherNumber: z.string().optional().describe('optional exact voucher number to drill a single voucher; usually combined with voucherType')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let inputParams = new Map<string, any>([
+          ['fromDate', args.fromDate],
+          ['toDate', args.toDate],
+          ['voucherType', args.voucherType || ''],
+          ['voucherNumber', args.voucherNumber || '']
+        ]);
+        if (args.targetCompany) inputParams.set('targetCompany', args.targetCompany);
+        const resp = await fetchReport('voucher-register', inputParams);
+        if (resp.error)
+          return { isError: true, content: [{ type: 'text', text: resp.error }] };
+        const tableID = await cacheTable(new Map<string, string>([['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'], ['party_ledger', 'string'], ['place_of_supply', 'string'], ['ledger_name', 'string'], ['ledger_group', 'string'], ['amount', 'amount'], ['dr_cr', 'string'], ['narration', 'string']]), resp.data);
+        return { content: [{ type: 'text', text: JSON.stringify({ tableID }) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'create-voucher',
+    {
+      title: 'Create Voucher (write)',
+      description: `WRITE TOOL. Posts a new accounting voucher (Journal, Payment, Receipt, Contra, or non-inventory Sales/Purchase/Credit Note/Debit Note) to Tally. Provide the ledger lines in entries: each has ledger (exact name, validate first), amount (positive magnitude) and isDebit (true=debit / false=credit). Total debits MUST equal total credits. The voucher is stamped with a REMOTEID which is returned on success — KEEP IT, it is required to delete/amend the voucher later (a voucher without a REMOTEID cannot be removed via the API). Does NOT handle inventory/stock lines. By default runs in dryRun mode returning the XML that WOULD be posted (nothing written). Pass dryRun=false to actually post. Before bulk posting to live books, dry-run and confirm the mapping with the user first`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+        date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('voucher date YYYY-MM-DD'),
+        voucherType: z.string().describe('exact voucher type name (e.g. Journal, Payment, Receipt, Contra, Sales, Purchase). validate using metadata/list-master with collection vouchertype'),
+        entries: z.array(z.object({
+          ledger: z.string().describe('exact ledger name'),
+          amount: z.number().positive().describe('positive amount magnitude'),
+          isDebit: z.boolean().describe('true = debit, false = credit')
+        })).min(2).describe('two or more ledger lines; total debit must equal total credit'),
+        narration: z.string().optional().describe('optional narration / remarks'),
+        reference: z.string().optional().describe('optional reference / bill number'),
+        voucherNumber: z.string().optional().describe('optional manual voucher number; skip to let Tally auto-number'),
+        partyLedger: z.string().optional().describe('optional party ledger name (recommended for Sales/Purchase/Payment/Receipt)'),
+        remoteId: z.string().optional().describe('optional explicit REMOTEID; skip to auto-generate. needed later to delete/amend'),
+        dryRun: z.boolean().optional().describe('defaults to true (preview only). set false to actually write to Tally')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        const entries = args.entries as { ledger: string; amount: number; isDebit: boolean }[];
+        let dr = 0, cr = 0;
+        for (const e of entries) { if (e.isDebit) dr += Math.abs(e.amount); else cr += Math.abs(e.amount); }
+        if (Math.abs(dr - cr) > 0.01)
+          return { isError: true, content: [{ type: 'text', text: `Voucher is not balanced: total debit ${dr.toFixed(2)} != total credit ${cr.toFixed(2)}. Adjust entries so debits equal credits.` }] };
+
+        const remoteId = args.remoteId || ('mcp-' + crypto.randomUUID());
+        const signedEntries = entries.map(e => ({ ledger: e.ledger, isDebit: e.isDebit, amount: ((e.isDebit ? -1 : 1) * Math.abs(e.amount)).toFixed(2) }));
+        let objInput = new Map<string, any>([
+          ['remoteId', remoteId],
+          ['voucherType', args.voucherType],
+          ['date', new Date(args.date)],
+          ['entries', signedEntries]
+        ]);
+        if (args.voucherNumber) objInput.set('voucherNumber', args.voucherNumber);
+        if (args.partyLedger) objInput.set('partyLedger', args.partyLedger);
+        if (args.reference) objInput.set('reference', args.reference);
+        if (args.narration) objInput.set('narration', args.narration);
+        if (args.targetCompany) objInput.set('targetCompany', args.targetCompany);
+
+        const dryRun = args.dryRun !== false;
+        if (dryRun) {
+          return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, message: `Preview only, nothing written. Debit=${dr.toFixed(2)} Credit=${cr.toFixed(2)}. Set dryRun=false to post this ${args.voucherType} voucher. remoteId that will be assigned: ${remoteId}`, remoteId, xml: renderPushTemplate('voucher-create', objInput) }, null, 2) }] };
+        }
+        const res = await importVouchers('voucher-create', objInput);
+        const ok = res.created > 0 && res.errors === 0 && res.exceptions === 0;
+        return { isError: !ok, content: [{ type: 'text', text: JSON.stringify({ dryRun: false, success: ok, remoteId, created: res.created, errors: res.errors, exceptions: res.exceptions, lineErrors: res.lineErrors, note: ok ? 'Voucher posted. Store remoteId to delete/amend later.' : 'Posting failed; see lineErrors.' }) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'delete-voucher',
+    {
+      title: 'Delete Voucher (write)',
+      description: `WRITE TOOL. Deletes a voucher from Tally identified by its REMOTEID. This ONLY works for vouchers created with a REMOTEID (e.g. via create-voucher, which returns one). Vouchers entered manually in Tally usually have no REMOTEID and cannot be deleted through the API. Provide the same date and voucherType used when the voucher was created. By default runs in dryRun mode (returns XML only). Pass dryRun=false to actually delete`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+        remoteId: z.string().describe('the REMOTEID returned by create-voucher when the voucher was posted'),
+        date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('voucher date YYYY-MM-DD (same as when created)'),
+        voucherType: z.string().describe('voucher type name (same as when created, e.g. Journal)'),
+        dryRun: z.boolean().optional().describe('defaults to true (preview only). set false to actually delete')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let objInput = new Map<string, any>([
+          ['remoteId', args.remoteId],
+          ['voucherType', args.voucherType],
+          ['date', new Date(args.date)]
+        ]);
+        if (args.targetCompany) objInput.set('targetCompany', args.targetCompany);
+        const dryRun = args.dryRun !== false;
+        if (dryRun) {
+          return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, message: `Preview only, nothing deleted. Set dryRun=false to delete voucher with remoteId ${args.remoteId}.`, xml: renderPushTemplate('voucher-delete', objInput) }, null, 2) }] };
+        }
+        const res = await importVouchers('voucher-delete', objInput);
+        const ok = res.deleted > 0 && res.errors === 0 && res.exceptions === 0;
+        return { isError: !ok, content: [{ type: 'text', text: JSON.stringify({ dryRun: false, success: ok, deleted: res.deleted, errors: res.errors, exceptions: res.exceptions, lineErrors: res.lineErrors, note: ok ? 'Voucher deleted.' : 'Delete failed (voucher may have no REMOTEID or wrong date/type).' }) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
       }
     }
   );
