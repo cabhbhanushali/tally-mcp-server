@@ -6,6 +6,22 @@ const pg = await PGlite.create('memory://');
 const PG_DATE_OID = 1082;
 const PG_NUMERIC_OID = 1700;
 
+// cached tables live 60 minutes (raised from 15) so multi-step reconciliations do not
+// have to re-pull mid-analysis
+const TABLE_TTL_MS = 60 * 60 * 1000;
+
+// remembers the column names/types of each cached table so callers can discover the
+// schema (avoids "Referenced column X not found" guessing in query-database)
+const tableSchemas = new Map<string, { name: string; type: string }[]>();
+
+export function getTableColumns(tableId: string): { name: string; type: string }[] | undefined {
+    return tableSchemas.get(tableId);
+}
+
+export function listCachedTables(): { tableId: string; columns: string[] }[] {
+    return Array.from(tableSchemas.entries()).map(([tableId, cols]) => ({ tableId, columns: cols.map(c => c.name) }));
+}
+
 const generateRandomString = (): string => {
     return 't_' + crypto.randomUUID().replace(/-/g, '');
 };
@@ -43,6 +59,9 @@ export async function cacheTable(lstColumnMetadata: Map<string, string>, data: a
         sqlCreateTable += `);`;
         await pg.exec(sqlCreateTable);
 
+        // remember the schema for discovery via describe-table
+        tableSchemas.set(tableId, Array.from(lstColumnMetadata.entries()).map(([name, type]) => ({ name, type })));
+
         // iterate through each row to insert data
         const colNames = Array.from(lstColumnMetadata.keys()).map(quoteIdent).join(', ');
         const placeholders = Array.from(lstColumnMetadata.keys()).map((_, i) => `$${i + 1}`).join(', ');
@@ -75,8 +94,8 @@ export async function cacheTable(lstColumnMetadata: Map<string, string>, data: a
             }
         });
 
-        // set timeout to drop the table after 15 min
-        setTimeout(async () => await pg.exec(`DROP TABLE IF EXISTS ${tableId};`), 15 * 60 * 1000);
+        // drop the table (and forget its schema) after the TTL
+        setTimeout(async () => { await pg.exec(`DROP TABLE IF EXISTS ${tableId};`); tableSchemas.delete(tableId); }, TABLE_TTL_MS);
 
         return tableId;
     } catch (err) {

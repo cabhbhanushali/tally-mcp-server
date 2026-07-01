@@ -3,6 +3,18 @@ import { PGlite } from '@electric-sql/pglite';
 const pg = await PGlite.create('memory://');
 const PG_DATE_OID = 1082;
 const PG_NUMERIC_OID = 1700;
+// cached tables live 60 minutes (raised from 15) so multi-step reconciliations do not
+// have to re-pull mid-analysis
+const TABLE_TTL_MS = 60 * 60 * 1000;
+// remembers the column names/types of each cached table so callers can discover the
+// schema (avoids "Referenced column X not found" guessing in query-database)
+const tableSchemas = new Map();
+export function getTableColumns(tableId) {
+    return tableSchemas.get(tableId);
+}
+export function listCachedTables() {
+    return Array.from(tableSchemas.entries()).map(([tableId, cols]) => ({ tableId, columns: cols.map(c => c.name) }));
+}
 const generateRandomString = () => {
     return 't_' + crypto.randomUUID().replace(/-/g, '');
 };
@@ -32,6 +44,8 @@ export async function cacheTable(lstColumnMetadata, data) {
         sqlCreateTable = sqlCreateTable.slice(0, -2); // remove trailing comma
         sqlCreateTable += `);`;
         await pg.exec(sqlCreateTable);
+        // remember the schema for discovery via describe-table
+        tableSchemas.set(tableId, Array.from(lstColumnMetadata.entries()).map(([name, type]) => ({ name, type })));
         // iterate through each row to insert data
         const colNames = Array.from(lstColumnMetadata.keys()).map(quoteIdent).join(', ');
         const placeholders = Array.from(lstColumnMetadata.keys()).map((_, i) => `$${i + 1}`).join(', ');
@@ -65,8 +79,8 @@ export async function cacheTable(lstColumnMetadata, data) {
                 await tx.query(insertSQL, values);
             }
         });
-        // set timeout to drop the table after 15 min
-        setTimeout(async () => await pg.exec(`DROP TABLE IF EXISTS ${tableId};`), 15 * 60 * 1000);
+        // drop the table (and forget its schema) after the TTL
+        setTimeout(async () => { await pg.exec(`DROP TABLE IF EXISTS ${tableId};`); tableSchemas.delete(tableId); }, TABLE_TTL_MS);
         return tableId;
     }
     catch (err) {

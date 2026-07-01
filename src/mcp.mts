@@ -3,7 +3,7 @@ import { z } from 'zod';
 import crypto from 'node:crypto';
 import dotenv from 'dotenv';
 import { fetchReport, importMasters, importVouchers, renderPushTemplate, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
-import { cacheTable, executeSQL } from './database.mjs';
+import { cacheTable, executeSQL, getTableColumns, listCachedTables } from './database.mjs';
 import { lstCollectionFields, lstOptionCountryState } from './definition.mjs';
 import { parseVoucherWorkbook } from './excel.mjs';
 import { utility } from './utility.mjs';
@@ -854,6 +854,30 @@ export async function registerMcpServer(): Promise<McpServer> {
           isError: true, content: [{ type: 'text', text: JSON.stringify(err) }]
         };
       }
+    }
+  );
+
+  mcpServer.registerTool(
+    'describe-table',
+    {
+      title: 'Describe Cached Table',
+      description: `returns the column names and types of a cached in-memory table (the tableID returned by report tools), or lists all live cached tables if tableID is omitted. Use this before writing a query-database SQL query to get the exact column names and avoid "Referenced column not found" errors`,
+      inputSchema: {
+        tableID: z.string().optional().describe('the tableID to describe. omit to list all currently cached tables and their columns')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      if (!args.tableID) {
+        return { content: [{ type: 'text', text: JSON.stringify({ tables: listCachedTables() }) }] };
+      }
+      const cols = getTableColumns(args.tableID);
+      if (!cols)
+        return { isError: true, content: [{ type: 'text', text: `No cached table ${args.tableID} (it may have expired or never existed). Call describe-table with no argument to list live tables.` }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ tableID: args.tableID, columns: cols }) }] };
     }
   );
 
