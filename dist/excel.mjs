@@ -166,4 +166,32 @@ export function parseVoucherWorkbook(filePath, sheetName) {
     }
     return result;
 }
+/* Writes an array of row objects to a .csv or .xlsx file on disk. Used by the export-to-file
+ * tool to hand a cached report table off to Python / Excel. Creates the parent folder if needed.
+ * Returns the absolute path written and the row/column counts. */
+export function exportRowsToFile(filePath, rows, fileFormat) {
+    const ext = (fileFormat || path.extname(filePath).replace('.', '').toLowerCase() || 'csv');
+    const dir = path.dirname(filePath);
+    if (dir && !fs.existsSync(dir))
+        fs.mkdirSync(dir, { recursive: true });
+    const columns = rows.length ? Object.keys(rows[0]) : [];
+    if (ext === 'xlsx' || ext === 'xls') {
+        const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{}]);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Data');
+        XLSX.writeFile(wb, filePath);
+    }
+    else {
+        // CSV with a UTF-8 BOM so Excel opens Unicode cleanly
+        const esc = (v) => {
+            const s = v === null || v === undefined ? '' : String(v);
+            return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        let csv = columns.map(esc).join(',') + '\r\n';
+        for (const r of rows)
+            csv += columns.map(c => esc(r[c])).join(',') + '\r\n';
+        fs.writeFileSync(filePath, '﻿' + csv, 'utf8');
+    }
+    return { path: filePath, rows: rows.length, columns: columns.length };
+}
 //# sourceMappingURL=excel.mjs.map

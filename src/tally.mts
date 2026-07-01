@@ -144,13 +144,17 @@ export async function queryCollection(targetCollection: string, lstFields: strin
                     let _value = rowObj[field.name.toUpperCase()].toString();
                     let value: number | string | boolean | Date | null | undefined = undefined;
                     if (field.datatype == 'boolean')
-                        value = _value == 'Yes';
+                        // the generic collection template emits booleans as 1/0, but some report
+                        // paths emit Yes/No / true — accept all truthy encodings
+                        value = _value == '1' || _value == 'Yes' || _value == 'True' || _value == 'true';
                     else if (field.datatype == 'number' || field.datatype == 'amount' || field.datatype == 'quantity' || field.datatype == 'rate')
                         value = parseFloat(_value);
                     else if (field.datatype == 'date')
                         value = utility.Date.parse(_value, 'yyyy-MM-dd');
                     else
-                        value = utility.String.unescapeHTML(_value);
+                        // strip Tally control-char noise (&#4; entities + raw control chars) so the
+                        // value is safe for JSON / downstream systems like Zoho
+                        value = utility.String.unescapeHTML(_value).replace(/&#\d+;/g, '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
 
                     Object.defineProperty(o, field.name, { enumerable: true, value });
                 }
@@ -266,6 +270,121 @@ export async function importVouchers(templateKey: string, objInput: Map<string, 
         status.lineErrors.push(err instanceof Error ? err.message : (typeof err === 'string' ? err : 'Voucher import failed'));
         return status;
     }
+}
+
+export interface NestedWalkField {
+    key: string;                                   // output property name
+    set: string;                                   // raw TDL SET expression (evaluated at the innermost scope)
+    datatype: 'string' | 'amount' | 'number' | 'date';
+}
+
+/*
+ * Fetches a nested Tally collection by walking a dotted object path (e.g.
+ * "Voucher.AllLedgerEntries.BillAllocations") and FLATTENING every leaf into one row.
+ *
+ * This uses the battle-tested tally-database-loader pattern: TYPE=Data with
+ * SVEXPORTFORMAT "XML (Data Interchange)", one <PART>/<LINE> per path level with an
+ * <EXPLODE> chain, blank intermediate lines and F01.. tagged leaf fields, parsed back with
+ * the loader's tab-manipulation. It does NOT crash Tally the way a hand-rolled
+ * <XMLTAG>ROW</XMLTAG> double-EXPLODE report does.
+ *
+ * routePath  : dotted path; first segment is the base collection TYPE.
+ * fields     : leaf fields (order preserved; the FIRST field must never be empty — use Guid).
+ * filters    : raw TDL formula strings applied to the base collection (already XML-escaped).
+ * fetchList  : intermediate collections to FETCH on the base collection.
+ */
+export async function fetchNestedWalk(
+    routePath: string,
+    fields: NestedWalkField[],
+    filters: string[],
+    fetchList: string[],
+    statics: { fromDate?: Date; toDate?: Date; targetCompany?: string }
+): Promise<any[]> {
+    const segments = routePath.split('.').map(s => s.trim()).filter(Boolean);
+    const baseCollection = segments[0];
+    const routes = ['MyCollection', ...segments.slice(1)]; // repeat sources per level
+
+    const pad2 = (n: number) => String(n).padStart(2, '0');
+
+    // PART per level (each repeats over its route source and explodes into the next)
+    let partsXml = '';
+    for (let i = 0; i < routes.length; i++)
+        partsXml += `<PART NAME="MyPart${pad2(i + 1)}"><LINES>MyLine${pad2(i + 1)}</LINES><REPEAT>MyLine${pad2(i + 1)} : ${routes[i]}</REPEAT><SCROLLED>Vertical</SCROLLED></PART>`;
+
+    // intermediate LINEs carry a blank field and explode into the next PART
+    let linesXml = '';
+    for (let i = 0; i < routes.length - 1; i++)
+        linesXml += `<LINE NAME="MyLine${pad2(i + 1)}"><FIELDS>FldBlank</FIELDS><EXPLODE>MyPart${pad2(i + 2)}</EXPLODE></LINE>`;
+
+    // leaf LINE carries the actual tagged fields
+    const leafTags = fields.map((_, i) => `F${pad2(i + 1)}`).join(',');
+    linesXml += `<LINE NAME="MyLine${pad2(routes.length)}"><FIELDS>${leafTags}</FIELDS></LINE>`;
+
+    let fieldsXml = '';
+    fields.forEach((f, i) => {
+        fieldsXml += `<FIELD NAME="F${pad2(i + 1)}"><SET>${f.set}</SET><XMLTAG>F${pad2(i + 1)}</XMLTAG></FIELD>`;
+    });
+    fieldsXml += `<FIELD NAME="FldBlank"><SET>""</SET></FIELD>`;
+
+    let filterRefsXml = '', filterDefsXml = '';
+    if (filters.length) {
+        filterRefsXml = `<FILTER>${filters.map((_, j) => `Fltr${pad2(j + 1)}`).join(',')}</FILTER>`;
+        filterDefsXml = filters.map((expr, j) => `<SYSTEM TYPE="Formulae" NAME="Fltr${pad2(j + 1)}">${expr}</SYSTEM>`).join('');
+    }
+    const fetchXml = fetchList.length ? `<FETCH>${fetchList.join(',')}</FETCH>` : '';
+
+    let staticsXml = '<SVEXPORTFORMAT>XML (Data Interchange)</SVEXPORTFORMAT>';
+    if (statics.fromDate) staticsXml += `<SVFROMDATE>${utility.Date.format(statics.fromDate, 'd-MMM-yyyy')}</SVFROMDATE>`;
+    if (statics.toDate) staticsXml += `<SVTODATE>${utility.Date.format(statics.toDate, 'd-MMM-yyyy')}</SVTODATE>`;
+    if (statics.targetCompany && statics.targetCompany !== '##SVCurrentCompany')
+        staticsXml += `<SVCURRENTCOMPANY>${utility.String.escapeHTML(statics.targetCompany)}</SVCURRENTCOMPANY>`;
+
+    const xml = `<?xml version="1.0" encoding="utf-8"?><ENVELOPE><HEADER><VERSION>1</VERSION><TALLYREQUEST>Export</TALLYREQUEST><TYPE>Data</TYPE><ID>TallyMcpNestedWalk</ID></HEADER><BODY><DESC><STATICVARIABLES>${staticsXml}</STATICVARIABLES><TDL><TDLMESSAGE><REPORT NAME="TallyMcpNestedWalk"><FORMS>MyForm</FORMS></REPORT><FORM NAME="MyForm"><PARTS>MyPart01</PARTS></FORM>${partsXml}${linesXml}${fieldsXml}<COLLECTION NAME="MyCollection"><TYPE>${baseCollection}</TYPE>${fetchXml}${filterRefsXml}</COLLECTION>${filterDefsXml}</TDLMESSAGE></TDL></DESC></BODY></ENVELOPE>`;
+
+    const raw = await postTallyXML(xml);
+    if (!raw)
+        throw new Error('Empty response from Tally (nested walk)');
+    if (raw.startsWith('<EXCEPTION>')) {
+        const em = raw.match(/<EXCEPTION>(.+?)<\/EXCEPTION>/);
+        throw new Error(em ? em[1].trim() : 'Tally exception');
+    }
+    if (/<RESPONSE>|Unknown Request/i.test(raw) && !raw.includes('<F01>'))
+        throw new Error('Tally rejected the nested-walk request: ' + raw.replace(/\s+/g, ' ').slice(0, 200));
+
+    // loader-style tab manipulation: collapse to tab-separated rows, one per leaf
+    let t = raw
+        .replace('<ENVELOPE>', '').replace('</ENVELOPE>', '')
+        .replace(/<FLDBLANK><\/FLDBLANK>/g, '')
+        .replace(/\s+\r\n/g, '')
+        .replace(/\r\n/g, '')
+        .replace(/\t/g, ' ')
+        .replace(/\s+<F/g, '<F')
+        .replace(/<\/F\d+>/g, '')
+        .replace(/<F01>/g, '\r\n')
+        .replace(/<F\d+>/g, '\t')
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+        .replace(/&tab;/g, '').replace(/&#\d+;/g, '');
+
+    const rows: any[] = [];
+    for (const line of t.split(/\r\n/)) {
+        if (!line.trim()) continue;
+        const cells = line.split('\t');
+        const o: any = {};
+        fields.forEach((f, i) => {
+            const raw = (cells[i] ?? '').trim();
+            let value: any;
+            if (f.datatype === 'amount' || f.datatype === 'number')
+                value = raw === '' || isNaN(parseFloat(raw)) ? 0 : parseFloat(raw);
+            else if (f.datatype === 'date')
+                value = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? utility.Date.parse(raw, 'yyyy-MM-dd') : null;
+            else
+                value = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+            Object.defineProperty(o, f.key, { enumerable: true, value });
+        });
+        rows.push(o);
+    }
+    return rows;
 }
 
 /* Renders a push template to its final XML WITHOUT posting to Tally — used for write dry-runs. */

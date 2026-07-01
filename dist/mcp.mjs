@@ -2,13 +2,95 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import dotenv from 'dotenv';
-import { fetchReport, importMasters, importVouchers, renderPushTemplate, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
-import { cacheTable, executeSQL, getTableColumns, listCachedTables } from './database.mjs';
+import { fetchReport, importMasters, importVouchers, renderPushTemplate, invokeTallyAction, queryCollection, renameObjectArrayProperties, fetchNestedWalk } from './tally.mjs';
+import { cacheTable, executeSQL, getTableColumns, listCachedTables, fetchTableRows } from './database.mjs';
 import { lstCollectionFields, lstOptionCountryState } from './definition.mjs';
-import { parseVoucherWorkbook } from './excel.mjs';
+import { parseVoucherWorkbook, exportRowsToFile } from './excel.mjs';
 import { utility } from './utility.mjs';
 dotenv.config({ override: true, quiet: true });
 const lstCollections = lstCollectionFields.map((item) => item.collection);
+// Tally reserved primary-group -> suggested Zoho Books account_type. _PrimaryGroup rolls every
+// user group up to its nearest reserved ancestor, so custom groups are covered too.
+const PL_PRIMARY_GROUPS = new Set(['Sales Accounts', 'Purchase Accounts', 'Direct Incomes', 'Direct Expenses', 'Indirect Incomes', 'Indirect Expenses', 'Income (Direct)', 'Income (Indirect)', 'Expenses (Direct)', 'Expenses (Indirect)']);
+const ZOHO_ACCOUNT_TYPE_MAP = {
+    'Sundry Debtors': 'accounts_receivable',
+    'Sundry Creditors': 'accounts_payable',
+    'Bank Accounts': 'bank',
+    'Bank OD A/c': 'bank',
+    'Bank OCC A/c': 'bank',
+    'Cash-in-Hand': 'cash',
+    'Duties & Taxes': 'other_current_liability',
+    'Provisions': 'other_current_liability',
+    'Current Liabilities': 'other_current_liability',
+    'Suspense A/c': 'other_current_liability',
+    'Loans (Liability)': 'long_term_liability',
+    'Secured Loans': 'long_term_liability',
+    'Unsecured Loans': 'long_term_liability',
+    'Capital Account': 'equity',
+    'Reserves & Surplus': 'equity',
+    'Current Assets': 'other_current_asset',
+    'Loans & Advances (Asset)': 'other_current_asset',
+    'Branch / Divisions': 'other_current_asset',
+    'Deposits (Asset)': 'other_asset',
+    'Investments': 'other_asset',
+    'Misc. Expenses (ASSET)': 'other_asset',
+    'Stock-in-Hand': 'stock',
+    'Fixed Assets': 'fixed_asset',
+    'Sales Accounts': 'income',
+    'Direct Incomes': 'income',
+    'Income (Direct)': 'income',
+    'Indirect Incomes': 'other_income',
+    'Income (Indirect)': 'other_income',
+    'Purchase Accounts': 'cost_of_goods_sold',
+    'Direct Expenses': 'cost_of_goods_sold',
+    'Expenses (Direct)': 'cost_of_goods_sold',
+    'Indirect Expenses': 'expense',
+    'Expenses (Indirect)': 'expense'
+};
+// GST state code by Tally state name (used to derive place-of-supply code for Zoho)
+const GST_STATE_CODE = {
+    'jammu & kashmir': '01', 'himachal pradesh': '02', 'punjab': '03', 'chandigarh': '04', 'uttarakhand': '05',
+    'haryana': '06', 'delhi': '07', 'rajasthan': '08', 'uttar pradesh': '09', 'bihar': '10', 'sikkim': '11',
+    'arunachal pradesh': '12', 'nagaland': '13', 'manipur': '14', 'mizoram': '15', 'tripura': '16', 'meghalaya': '17',
+    'assam': '18', 'west bengal': '19', 'jharkhand': '20', 'odisha': '21', 'chhattisgarh': '22', 'madhya pradesh': '23',
+    'gujarat': '24', 'dadra & nagar haveli and daman & diu': '26', 'maharashtra': '27', 'karnataka': '29', 'goa': '30',
+    'lakshadweep': '31', 'kerala': '32', 'tamil nadu': '33', 'puducherry': '34', 'andaman & nicobar': '35',
+    'telangana': '36', 'andhra pradesh': '37', 'ladakh': '38'
+};
+function gstStateCode(stateName, gstin) {
+    if (gstin && /^\d{2}/.test(gstin))
+        return gstin.substring(0, 2); // GSTIN first 2 digits are authoritative
+    return GST_STATE_CODE[(stateName || '').trim().toLowerCase()] || '';
+}
+function mapZohoAccountType(primaryGroup) {
+    const pg = (primaryGroup || '').trim();
+    const account_head = PL_PRIMARY_GROUPS.has(pg) ? 'Profit & Loss' : 'Balance Sheet';
+    const type = ZOHO_ACCOUNT_TYPE_MAP[pg];
+    if (!type) {
+        // blank primary group is usually the reserved "Profit & Loss A/c" ledger (-> Zoho retained earnings/equity)
+        if (pg === '')
+            return { zoho_account_type: 'equity', account_head: 'Balance Sheet', confidence: 'low', note: 'no primary group (likely Profit & Loss A/c) — review' };
+        return { zoho_account_type: '', account_head, confidence: 'low', note: `unmapped primary group "${pg}" — set Zoho account_type manually` };
+    }
+    let note = '', confidence = 'high';
+    if (pg === 'Duties & Taxes') {
+        note = 'GST/TDS control — in Zoho use the built-in tax accounts or output_tax/input_tax as appropriate';
+        confidence = 'medium';
+    }
+    else if (pg === 'Suspense A/c') {
+        note = 'suspense — reclassify before go-live';
+        confidence = 'low';
+    }
+    else if (pg === 'Deposits (Asset)') {
+        note = 'if realisable within 12 months use other_current_asset';
+        confidence = 'medium';
+    }
+    else if (pg === 'Investments') {
+        note = 'no dedicated Zoho investment type; other_asset';
+        confidence = 'medium';
+    }
+    return { zoho_account_type: type, account_head, confidence, note };
+}
 export async function registerMcpServer() {
     const mcpServer = new McpServer({
         name: 'Tally Prime MCP Server',
@@ -244,6 +326,33 @@ export async function registerMcpServer() {
             };
         }
     });
+    mcpServer.registerTool('zoho-coa-map', {
+        title: 'Zoho Chart-of-Accounts Mapping',
+        description: `maps every Tally ledger to a suggested Zoho Books account_type for migration. Pulls all ledgers and derives, from the Tally reserved primary group, the Zoho account_type (accounts_receivable, accounts_payable, bank, cash, other_current_asset, other_asset, fixed_asset, stock, other_current_liability, long_term_liability, equity, income, other_income, cost_of_goods_sold, expense). Fields: ledger_name, group_name, primary_group, account_head (Balance Sheet / Profit & Loss), zoho_account_type, confidence (high/medium/low), note. Turns COA mapping into a review-and-tweak step — sort by confidence to find the ledgers that need a human decision. Result cached in an in-memory table (tableID); use query-database against it. Pure logic over the ledger masters — no period needed.`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company')
+        },
+        annotations: {
+            readOnlyHint: true,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const ledgers = await queryCollection('Ledger', ['Name', 'Parent', '_PrimaryGroup'], new Map(), args.targetCompany);
+            const rows = ledgers.map((l) => {
+                const m = mapZohoAccountType(l._PrimaryGroup);
+                return { ledger_name: l.Name, group_name: l.Parent, primary_group: l._PrimaryGroup, account_head: m.account_head, zoho_account_type: m.zoho_account_type, confidence: m.confidence, note: m.note };
+            });
+            const tableID = await cacheTable(new Map([
+                ['ledger_name', 'string'], ['group_name', 'string'], ['primary_group', 'string'],
+                ['account_head', 'string'], ['zoho_account_type', 'string'], ['confidence', 'string'], ['note', 'string']
+            ]), rows);
+            return { content: [{ type: 'text', text: JSON.stringify({ tableID, rowCount: rows.length }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
     mcpServer.registerTool('trial-balance', {
         title: 'Trial Balance',
         description: `fetches trial balance with fields ledger_name, group_name (blank if Profit & Loss), opening_balance, net_debit, net_credit, closing_balance. opening_balance and closing_balance negative is debit and positive is credit. kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
@@ -464,7 +573,7 @@ export async function registerMcpServer() {
     });
     mcpServer.registerTool('bills-outstanding', {
         title: 'Bills Outstanding',
-        description: `fetches pending overdue outstanding bills receivable or payable as on date with fields bill_date,reference_number,outstanding_amount,party_name,overdue_days. outstanding_amount = Debit is negative and Credit is positive. party_name = ledger_name. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+        description: `fetches pending overdue outstanding bills receivable or payable as on date with fields bill_date,reference_number,outstanding_amount,party_name,overdue_days,due_date,party_gstin. outstanding_amount = Debit is negative and Credit is positive. party_name = ledger_name. due_date = bill date + credit period (for Zoho opening invoice/bill). party_gstin = GSTIN of the party (for Zoho AR/AP contact mapping). returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
         inputSchema: {
             targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
             nature: z.enum(['receivable', 'payable']),
@@ -480,9 +589,9 @@ export async function registerMcpServer() {
             if (args.nature) {
                 lstFilters.set('Nature', `$$IsEqual:($_PrimaryGroup:Group:($Parent:Ledger:$Parent)):"${args.nature === 'receivable' ? 'Sundry Debtors' : 'Sundry Creditors'}"`);
             }
-            let result = await queryCollection('Bill', ['BillDate', 'Name', 'ClosingBalance', 'Parent', '_OverDueDays'], lstFilters, args.targetCompany, undefined, new Date(args.toDate));
-            result = renameObjectArrayProperties(result, new Map([['BillDate', 'bill_date'], ['Name', 'reference_number'], ['ClosingBalance', 'outstanding_amount'], ['Parent', 'party_name'], ['_OverDueDays', 'overdue_days']]));
-            let tableID = await cacheTable(new Map([['bill_date', 'date'], ['reference_number', 'string'], ['outstanding_amount', 'number'], ['party_name', 'string'], ['overdue_days', 'number']]), result);
+            let result = await queryCollection('Bill', ['BillDate', 'Name', 'ClosingBalance', 'Parent', '_OverDueDays', 'DueDate', 'BillPartyGSTIN'], lstFilters, args.targetCompany, undefined, new Date(args.toDate));
+            result = renameObjectArrayProperties(result, new Map([['BillDate', 'bill_date'], ['Name', 'reference_number'], ['ClosingBalance', 'outstanding_amount'], ['Parent', 'party_name'], ['_OverDueDays', 'overdue_days'], ['DueDate', 'due_date'], ['BillPartyGSTIN', 'party_gstin']]));
+            let tableID = await cacheTable(new Map([['bill_date', 'date'], ['reference_number', 'string'], ['outstanding_amount', 'number'], ['party_name', 'string'], ['overdue_days', 'number'], ['due_date', 'date'], ['party_gstin', 'string']]), result);
             return {
                 content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
             };
@@ -492,6 +601,86 @@ export async function registerMcpServer() {
                 isError: true,
                 content: [{ type: 'text', text: JSON.stringify(err) }]
             };
+        }
+    });
+    mcpServer.registerTool('ledger-closing-balances', {
+        title: 'Ledger Closing Balances (as on date)',
+        description: `fetches the closing balance of every ledger AS ON a single date, ready for a Tally-to-Zoho opening-balance migration — one call, no period math. Fields: ledger_name, group_name, primary_group (Tally reserved group e.g. Sundry Debtors), account_head (Balance Sheet / Profit & Loss), closing_balance (debit negative / credit positive), dr_cr (Dr / Cr). Set level='primary_group' to instead get control totals per primary group (AR / AP / Bank / Duties & Taxes etc.) — ideal for tying the migrated opening balances group-wise. Result cached in an in-memory table (tableID); use query-database against it.`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('as-on date YYYY-MM-DD (the migration cut-off)'),
+            level: z.enum(['ledger', 'primary_group']).optional().describe("output granularity: 'ledger' (default, one row per ledger) or 'primary_group' (control totals per reserved group)")
+        },
+        annotations: {
+            readOnlyHint: true,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const ledgers = await queryCollection('Ledger', ['Name', 'Parent', '_PrimaryGroup', 'ClosingBalance'], new Map(), args.targetCompany, undefined, new Date(args.toDate));
+            const detail = ledgers.map((l) => {
+                const bal = typeof l.ClosingBalance === 'number' && !isNaN(l.ClosingBalance) ? l.ClosingBalance : 0;
+                const m = mapZohoAccountType(l._PrimaryGroup);
+                return { ledger_name: l.Name, group_name: l.Parent, primary_group: l._PrimaryGroup, account_head: m.account_head, closing_balance: bal, dr_cr: bal < 0 ? 'Dr' : (bal > 0 ? 'Cr' : '') };
+            });
+            if (args.level === 'primary_group') {
+                const agg = new Map();
+                for (const r of detail) {
+                    const k = r.primary_group || '(none)';
+                    const e = agg.get(k) || { primary_group: k, account_head: r.account_head, closing_balance: 0, ledger_count: 0 };
+                    e.closing_balance += r.closing_balance;
+                    e.ledger_count += 1;
+                    agg.set(k, e);
+                }
+                const rows = Array.from(agg.values()).map(e => ({ ...e, dr_cr: e.closing_balance < 0 ? 'Dr' : (e.closing_balance > 0 ? 'Cr' : '') }));
+                const tableID = await cacheTable(new Map([['primary_group', 'string'], ['account_head', 'string'], ['closing_balance', 'amount'], ['dr_cr', 'string'], ['ledger_count', 'number']]), rows);
+                return { content: [{ type: 'text', text: JSON.stringify({ tableID, rowCount: rows.length, level: 'primary_group' }) }] };
+            }
+            const tableID = await cacheTable(new Map([['ledger_name', 'string'], ['group_name', 'string'], ['primary_group', 'string'], ['account_head', 'string'], ['closing_balance', 'amount'], ['dr_cr', 'string']]), detail);
+            return { content: [{ type: 'text', text: JSON.stringify({ tableID, rowCount: detail.length, level: 'ledger' }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('party-balances', {
+        title: 'Party Balances (debtors / creditors, advance-aware)',
+        description: `fetches the closing balance of every Sundry Debtor and Sundry Creditor ledger AS ON a date, flagging likely ADVANCE ledgers so you can net advance-vs-bill the way Tally does but Zoho does not (the #1 recurring AR/AP migration diff). Fields: ledger_name, primary_group (Sundry Debtors / Sundry Creditors), group_name, closing_balance (debit negative / credit positive), dr_cr, is_advance (Yes when the ledger name/group looks like an advance account), party_base (best-effort base party name with the advance token stripped — GROUP BY this in query-database to get the net per party, then eyeball the pairings since naming is client-specific). Optionally restrict with nature. Result cached in an in-memory table (tableID); use query-database against it.`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('as-on date YYYY-MM-DD'),
+            nature: z.enum(['receivable', 'payable', 'both']).optional().describe("'receivable' (Sundry Debtors), 'payable' (Sundry Creditors) or 'both' (default)")
+        },
+        annotations: {
+            readOnlyHint: true,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const nature = args.nature || 'both';
+            let filterExpr = '';
+            if (nature === 'receivable')
+                filterExpr = '$$IsEqual:$_PrimaryGroup:"Sundry Debtors"';
+            else if (nature === 'payable')
+                filterExpr = '$$IsEqual:$_PrimaryGroup:"Sundry Creditors"';
+            else
+                filterExpr = '$$IsEqual:$_PrimaryGroup:"Sundry Debtors" OR $$IsEqual:$_PrimaryGroup:"Sundry Creditors"';
+            const lstFilters = new Map([['PartyGroup', filterExpr]]);
+            const ledgers = await queryCollection('Ledger', ['Name', 'Parent', '_PrimaryGroup', 'ClosingBalance'], lstFilters, args.targetCompany, undefined, new Date(args.toDate));
+            const advRe = /(^|[\s_\-])(advance|adv|advances)([\s_\-]|$)/i;
+            const rows = ledgers.map((l) => {
+                const bal = typeof l.ClosingBalance === 'number' && !isNaN(l.ClosingBalance) ? l.ClosingBalance : 0;
+                const name = l.Name || '';
+                const grp = l.Parent || '';
+                const isAdvance = advRe.test(name) || /advance/i.test(grp);
+                const party_base = isAdvance ? name.replace(advRe, ' ').replace(/\s+/g, ' ').trim() : name;
+                return { ledger_name: name, primary_group: l._PrimaryGroup, group_name: grp, closing_balance: bal, dr_cr: bal < 0 ? 'Dr' : (bal > 0 ? 'Cr' : ''), is_advance: isAdvance ? 'Yes' : 'No', party_base };
+            });
+            const tableID = await cacheTable(new Map([['ledger_name', 'string'], ['primary_group', 'string'], ['group_name', 'string'], ['closing_balance', 'amount'], ['dr_cr', 'string'], ['is_advance', 'string'], ['party_base', 'string']]), rows);
+            return { content: [{ type: 'text', text: JSON.stringify({ tableID, rowCount: rows.length, advanceLedgers: rows.filter(r => r.is_advance === 'Yes').length }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
         }
     });
     mcpServer.registerTool('ledger-account', {
@@ -754,7 +943,7 @@ export async function registerMcpServer() {
     });
     mcpServer.registerTool('company-info', {
         title: 'Company Info',
-        description: `returns basic information of the open company/companies in Tally with fields company_name, financial_year_start, financial_year_end, state, country, email. Useful to establish the correct financial year and reporting context before running dated reports. returns JSON array of objects`,
+        description: `returns basic information of the open company/companies in Tally with fields company_name, financial_year_start, financial_year_end, state, state_code (GST state code), gstin (company GSTIN, may be blank), country, email. Useful to establish the correct financial year, GST place-of-supply and reporting context before running dated reports. returns JSON array of objects`,
         inputSchema: {
             targetCompany: z.string().optional().describe('optional company name. skip for default active company. validate using list-master / metadata with collection Company')
         },
@@ -764,7 +953,7 @@ export async function registerMcpServer() {
         }
     }, async (args) => {
         try {
-            let raw = await queryCollection('Company', ['Name', 'BooksFrom', 'StateName', 'CountryName', 'Email'], new Map(), args.targetCompany);
+            let raw = await queryCollection('Company', ['Name', 'BooksFrom', 'StateName', 'CountryName', 'Email', 'GSTRegistrationNumber'], new Map(), args.targetCompany);
             let result = raw.map((r) => {
                 const s = r.BooksFrom;
                 let fyStart = null, fyEnd = null;
@@ -774,7 +963,8 @@ export async function registerMcpServer() {
                     e.setDate(e.getDate() - 1);
                     fyEnd = utility.Date.format(e, 'yyyy-MM-dd');
                 }
-                return { company_name: r.Name, financial_year_start: fyStart, financial_year_end: fyEnd, state: r.StateName, country: r.CountryName, email: r.Email };
+                const gstin = r.GSTRegistrationNumber || '';
+                return { company_name: r.Name, financial_year_start: fyStart, financial_year_end: fyEnd, state: r.StateName, state_code: gstStateCode(r.StateName, gstin), gstin, country: r.CountryName, email: r.Email };
             });
             return { content: [{ type: 'text', text: JSON.stringify(result) }] };
         }
@@ -843,6 +1033,54 @@ export async function registerMcpServer() {
                 return { isError: true, content: [{ type: 'text', text: resp.error }] };
             const tableID = await cacheTable(new Map([['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'], ['party_ledger', 'string'], ['place_of_supply', 'string'], ['ledger_name', 'string'], ['ledger_group', 'string'], ['amount', 'amount'], ['dr_cr', 'string'], ['narration', 'string']]), resp.data);
             return { content: [{ type: 'text', text: JSON.stringify({ tableID }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('voucher-bill-allocations', {
+        title: 'Voucher Bill Allocations',
+        description: `fetches bill-wise allocations (the Agst Ref / New Ref mapping) for every voucher in a period — one row per bill reference on each party ledger line. Fields: guid, date, voucher_type, voucher_number, party_ledger (voucher header party, may be blank), ledger (the debtor/creditor account the bill sits under — this is the effective party for the allocation), ledger_group (its group, e.g. Sundry Debtors / Sundry Creditors), bill_ref (the bill/reference name), ref_type (Agst Ref = settles an existing bill, New Ref = raises a new bill, Advance, On Account), amount (debit negative / credit positive). This is the #1 tool for mapping Tally receipts/payments to the invoices/bills they settle when migrating to Zoho. Bound by date range; optionally filter by voucherType (Tally-side) and party ledger (post-filter on the ledger column). Result cached in an in-memory table (tableID); use query-database against it (e.g. GROUP BY ledger, ref_type).`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period start date YYYY-MM-DD'),
+            toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period end date YYYY-MM-DD'),
+            voucherType: z.string().optional().describe('optional exact voucher type to filter by (e.g. Receipt, Payment, Sales, Purchase, Journal). skip for all'),
+            party: z.string().optional().describe('optional exact party/debtor/creditor ledger name to restrict to (matched against the ledger the bill is allocated under)')
+        },
+        annotations: {
+            readOnlyHint: true,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+            const fields = [
+                { key: 'guid', set: '$Guid', datatype: 'string' },
+                { key: 'date', set: 'if $$IsEmpty:$Date then "" else $$PyrlYYYYMMDDFormat:$Date:"-"', datatype: 'date' },
+                { key: 'voucher_type', set: '$VoucherTypeName', datatype: 'string' },
+                { key: 'voucher_number', set: '$VoucherNumber', datatype: 'string' },
+                { key: 'party_ledger', set: '$PartyLedgerName', datatype: 'string' },
+                { key: 'ledger', set: '$LedgerName', datatype: 'string' },
+                { key: 'ledger_group', set: '$Parent:Ledger:$LedgerName', datatype: 'string' },
+                { key: 'bill_ref', set: '$Name', datatype: 'string' },
+                { key: 'ref_type', set: '$BillType', datatype: 'string' },
+                { key: 'amount', set: '$$StringFindAndReplace:(if $$IsDebit:$Amount then -$$NumValue:$Amount else $$NumValue:$Amount):"(-)":"-"', datatype: 'amount' }
+            ];
+            const filters = ['NOT $IsCancelled', 'NOT $IsOptional', '$$NumItems:AllLedgerEntries &gt; 0'];
+            if (args.voucherType)
+                filters.push(`$$IsEqual:$VoucherTypeName:"${esc(args.voucherType)}"`);
+            let rows = await fetchNestedWalk('Voucher.AllLedgerEntries.BillAllocations', fields, filters, ['AllLedgerEntries'], { fromDate: new Date(args.fromDate), toDate: new Date(args.toDate), targetCompany: args.targetCompany });
+            if (args.party) {
+                const p = args.party.toLowerCase();
+                rows = rows.filter(r => (r.ledger || '').toLowerCase() === p);
+            }
+            const tableID = await cacheTable(new Map([
+                ['guid', 'string'], ['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'],
+                ['party_ledger', 'string'], ['ledger', 'string'], ['ledger_group', 'string'],
+                ['bill_ref', 'string'], ['ref_type', 'string'], ['amount', 'amount']
+            ]), rows);
+            return { content: [{ type: 'text', text: JSON.stringify({ tableID, rowCount: rows.length }) }] };
         }
         catch (err) {
             return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
@@ -1105,6 +1343,104 @@ export async function registerMcpServer() {
             }
             const posted = results.filter(r => r.success).length;
             return { content: [{ type: 'text', text: JSON.stringify({ dryRun: false, posted, failed: results.length - posted, skippedUnbalanced: unbalanced.length, parseErrors: parsed.errors, results }, null, 2) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('export-to-file', {
+        title: 'Export Cached Table to File',
+        description: `writes a cached in-memory report table (a tableID returned by any report tool) to a .csv or .xlsx file on disk, for a clean hand-off to Python / Excel during a migration. Provide the tableID and an absolute filePath; the format is inferred from the extension unless you pass format. The parent folder is created if missing and an existing file is overwritten. Returns the path written plus row/column counts.`,
+        inputSchema: {
+            tableID: z.string().describe('the tableID to export (from query-collection, day-book, voucher-bill-allocations, etc.). Use describe-table to list live tables'),
+            filePath: z.string().describe('absolute output path, e.g. C:/Users/bhavi/Tmp/bill_allocations.csv or .xlsx'),
+            format: z.enum(['csv', 'xlsx']).optional().describe('optional; inferred from the filePath extension when omitted')
+        },
+        annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const rows = await fetchTableRows(args.tableID);
+            const res = exportRowsToFile(args.filePath, rows, args.format);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ...res }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('migration-audit', {
+        title: 'Migration Data-Quality Audit',
+        description: `scans the Tally company for the data-quality issues that most often break a Tally-to-Zoho migration and returns them as a findings table (one row per issue: category, severity, entity_type, entity_name, detail). Master checks (always run): party_no_gstin (Sundry Debtors/Creditors without a GSTIN), ledger_no_primary_group (ledger not under any reserved group), duplicate_party (near-duplicate ledger names after stripping Ltd/Pvt/punctuation), negative_stock (stock item with a negative closing quantity). Transaction check (only when fromDate+toDate are given): unlinked_allocation (receipts/payments left On Account, i.e. not settled against a bill — the advances/unadjusted items to fix before migrating). Run this before starting a migration. Result cached in an in-memory table (tableID); use query-database to slice by category/severity, and export-to-file to hand it off.`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('optional as-on date for the negative-stock check (defaults to latest)'),
+            fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('optional period start; provide with toDate to also run the unlinked-allocation (On Account) transaction check')
+        },
+        annotations: {
+            readOnlyHint: true,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const findings = [];
+            // --- master checks ---
+            const ledgers = await queryCollection('Ledger', ['Name', '_PrimaryGroup', 'RegisteredGSTIN'], new Map(), args.targetCompany);
+            for (const l of ledgers) {
+                const pg = (l._PrimaryGroup || '').trim();
+                if ((pg === 'Sundry Debtors' || pg === 'Sundry Creditors') && !(l.RegisteredGSTIN || '').trim())
+                    findings.push({ category: 'party_no_gstin', severity: 'warning', entity_type: 'ledger', entity_name: l.Name, detail: `${pg} without GSTIN` });
+                if (pg === '')
+                    findings.push({ category: 'ledger_no_primary_group', severity: 'warning', entity_type: 'ledger', entity_name: l.Name, detail: 'ledger not under any reserved primary group' });
+            }
+            // near-duplicate party names (strip company-suffix noise + punctuation)
+            const NOISE = new Set(['ltd', 'limited', 'pvt', 'private', 'llp', 'llc', 'inc', 'co', 'company', 'the', 'and', 'corporation', 'corp']);
+            const normName = (n) => String(n || '').toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(t => t && !NOISE.has(t)).join('');
+            const byNorm = new Map();
+            for (const l of ledgers) {
+                const k = normName(l.Name);
+                if (!k)
+                    continue;
+                const arr = byNorm.get(k) || [];
+                arr.push(l.Name);
+                byNorm.set(k, arr);
+            }
+            for (const [k, names] of byNorm) {
+                const uniq = Array.from(new Set(names));
+                if (uniq.length > 1)
+                    findings.push({ category: 'duplicate_party', severity: 'warning', entity_type: 'ledger', entity_name: uniq[0], detail: `possible duplicates: ${uniq.join(' | ')}` });
+            }
+            // negative stock
+            const stock = await queryCollection('StockItem', ['Name', 'ClosingBalance'], new Map(), args.targetCompany, undefined, args.toDate ? new Date(args.toDate) : undefined);
+            for (const s of stock) {
+                if (typeof s.ClosingBalance === 'number' && s.ClosingBalance < 0)
+                    findings.push({ category: 'negative_stock', severity: 'error', entity_type: 'stock_item', entity_name: s.Name, detail: `negative closing quantity ${s.ClosingBalance}` });
+            }
+            // --- transaction check (optional) ---
+            if (args.fromDate && args.toDate) {
+                const fields = [
+                    { key: 'guid', set: '$Guid', datatype: 'string' },
+                    { key: 'voucher_type', set: '$VoucherTypeName', datatype: 'string' },
+                    { key: 'voucher_number', set: '$VoucherNumber', datatype: 'string' },
+                    { key: 'ledger', set: '$LedgerName', datatype: 'string' },
+                    { key: 'ref_type', set: '$BillType', datatype: 'string' },
+                    { key: 'amount', set: '$$StringFindAndReplace:(if $$IsDebit:$Amount then -$$NumValue:$Amount else $$NumValue:$Amount):"(-)":"-"', datatype: 'amount' }
+                ];
+                const allocs = await fetchNestedWalk('Voucher.AllLedgerEntries.BillAllocations', fields, ['NOT $IsCancelled', 'NOT $IsOptional', '$$NumItems:AllLedgerEntries &gt; 0'], ['AllLedgerEntries'], { fromDate: new Date(args.fromDate), toDate: new Date(args.toDate), targetCompany: args.targetCompany });
+                for (const a of allocs) {
+                    if ((a.ref_type || '') === 'On Account')
+                        findings.push({ category: 'unlinked_allocation', severity: 'warning', entity_type: 'voucher', entity_name: `${a.voucher_type} ${a.voucher_number}`, detail: `${a.ledger}: On Account ${a.amount} (not settled against a bill)` });
+                }
+            }
+            const summary = {};
+            for (const f of findings)
+                summary[f.category] = (summary[f.category] || 0) + 1;
+            const tableID = await cacheTable(new Map([
+                ['category', 'string'], ['severity', 'string'], ['entity_type', 'string'], ['entity_name', 'string'], ['detail', 'string']
+            ]), findings);
+            return { content: [{ type: 'text', text: JSON.stringify({ tableID, totalFindings: findings.length, summary }) }] };
         }
         catch (err) {
             return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };

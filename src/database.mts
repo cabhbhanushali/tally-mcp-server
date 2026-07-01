@@ -22,6 +22,15 @@ export function listCachedTables(): { tableId: string; columns: string[] }[] {
     return Array.from(tableSchemas.entries()).map(([tableId, cols]) => ({ tableId, columns: cols.map(c => c.name) }));
 }
 
+// Returns every row of a cached table as an array of objects (column-ordered keys).
+// Guards the tableId against the known-table registry so only internally-generated ids are queried.
+export async function fetchTableRows(tableId: string): Promise<any[]> {
+    if (!tableSchemas.has(tableId))
+        throw new Error(`No cached table ${tableId} (it may have expired). Re-run the tool that produced it.`);
+    const json = await executeSQL(`SELECT * FROM ${tableId}`, 'JSON Array of Objects');
+    return JSON.parse(json);
+}
+
 const generateRandomString = (): string => {
     return 't_' + crypto.randomUUID().replace(/-/g, '');
 };
