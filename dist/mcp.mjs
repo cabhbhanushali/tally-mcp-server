@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import { fetchReport, importMasters, importVouchers, renderPushTemplate, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
 import { cacheTable, executeSQL } from './database.mjs';
 import { lstCollectionFields, lstOptionCountryState } from './definition.mjs';
+import { parseVoucherWorkbook } from './excel.mjs';
 import { utility } from './utility.mjs';
 dotenv.config({ override: true, quiet: true });
 const lstCollections = lstCollectionFields.map((item) => item.collection);
@@ -845,6 +846,8 @@ export async function registerMcpServer() {
             voucherNumber: z.string().optional().describe('optional manual voucher number; skip to let Tally auto-number'),
             partyLedger: z.string().optional().describe('optional party ledger name (recommended for Sales/Purchase/Payment/Receipt)'),
             remoteId: z.string().optional().describe('optional explicit REMOTEID; skip to auto-generate. needed later to delete/amend'),
+            forexCurrency: z.string().optional().describe('optional foreign currency symbol e.g. "$", "€" for a foreign-currency voucher. When set, each entry amount is treated as the FOREIGN amount and the base amount = amount * forexRate. Provide together with forexRate'),
+            forexRate: z.number().optional().describe('optional exchange rate: base (local) units per 1 foreign unit e.g. 83 means 1 USD = 83 INR. Provide together with forexCurrency'),
             dryRun: z.boolean().optional().describe('defaults to true (preview only). set false to actually write to Tally')
         },
         annotations: {
@@ -855,17 +858,35 @@ export async function registerMcpServer() {
     }, async (args) => {
         try {
             const entries = args.entries;
+            const hasForex = !!args.forexCurrency && typeof args.forexRate === 'number';
+            if ((!!args.forexCurrency) !== (typeof args.forexRate === 'number'))
+                return { isError: true, content: [{ type: 'text', text: 'forexCurrency and forexRate must be provided together.' }] };
+            const rate = args.forexRate || 1;
+            // balance is checked in base currency
             let dr = 0, cr = 0;
             for (const e of entries) {
+                const base = Math.abs(e.amount) * (hasForex ? rate : 1);
                 if (e.isDebit)
-                    dr += Math.abs(e.amount);
+                    dr += base;
                 else
-                    cr += Math.abs(e.amount);
+                    cr += base;
             }
             if (Math.abs(dr - cr) > 0.01)
-                return { isError: true, content: [{ type: 'text', text: `Voucher is not balanced: total debit ${dr.toFixed(2)} != total credit ${cr.toFixed(2)}. Adjust entries so debits equal credits.` }] };
+                return { isError: true, content: [{ type: 'text', text: `Voucher is not balanced: total debit ${dr.toFixed(2)} != total credit ${cr.toFixed(2)} (base currency). Adjust entries so debits equal credits.` }] };
             const remoteId = args.remoteId || ('mcp-' + crypto.randomUUID());
-            const signedEntries = entries.map(e => ({ ledger: e.ledger, isDebit: e.isDebit, amount: ((e.isDebit ? -1 : 1) * Math.abs(e.amount)).toFixed(2) }));
+            const signedEntries = entries.map(e => {
+                const mag = Math.abs(e.amount);
+                const signedBase = (e.isDebit ? -1 : 1) * mag * (hasForex ? rate : 1);
+                let amountStr;
+                if (hasForex) {
+                    const signedForeign = (e.isDebit ? -1 : 1) * mag;
+                    amountStr = `${signedForeign.toFixed(2)}${args.forexCurrency} @ ${rate}/${args.forexCurrency} = ${signedBase.toFixed(2)}`;
+                }
+                else {
+                    amountStr = signedBase.toFixed(2);
+                }
+                return { ledger: e.ledger, isDebit: e.isDebit, amount: amountStr };
+            });
             let objInput = new Map([
                 ['remoteId', remoteId],
                 ['voucherType', args.voucherType],
@@ -925,6 +946,146 @@ export async function registerMcpServer() {
             const res = await importVouchers('voucher-delete', objInput);
             const ok = res.deleted > 0 && res.errors === 0 && res.exceptions === 0;
             return { isError: !ok, content: [{ type: 'text', text: JSON.stringify({ dryRun: false, success: ok, deleted: res.deleted, errors: res.errors, exceptions: res.exceptions, lineErrors: res.lineErrors, note: ok ? 'Voucher deleted.' : 'Delete failed (voucher may have no REMOTEID or wrong date/type).' }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('create-invoice-voucher', {
+        title: 'Create Invoice Voucher (write, inventory)',
+        description: `WRITE TOOL. Posts an INVOICE-mode Sales or Purchase voucher WITH stock/inventory items and GST to Tally (the inventory counterpart of create-voucher, which is accounting-only). Provide inventoryEntries (each: stockItemName, quantity, rate, unit, and itemLedger = the sales/purchase income or expense ledger the item value posts to) and optional ledgerEntries for taxes (CGST/SGST/IGST), freight, discount or round-off (each: ledger, amount, isDebit). The party (customer for Sales / supplier for Purchase) line is computed automatically so the voucher balances: for Sales the party is debited by the invoice total, for Purchase the party is credited. Validate every stock item and ledger name with list-master first. The voucher is stamped with a REMOTEID (returned on success) so it can be deleted later via delete-voucher. dryRun defaults true (preview XML, nothing written); pass dryRun=false to post. Before bulk posting to live books, dry-run and confirm the mapping with the user first`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('voucher date YYYY-MM-DD'),
+            voucherType: z.string().optional().describe('Sales (default) or Purchase, or an exact custom voucher type of that class. validate with list-master collection vouchertype'),
+            partyLedger: z.string().describe('customer ledger (Sales) or supplier ledger (Purchase); exact name, validate with list-master'),
+            inventoryEntries: z.array(z.object({
+                stockItemName: z.string().describe('exact stock item name'),
+                quantity: z.number().positive().describe('quantity (positive)'),
+                rate: z.number().describe('rate per unit'),
+                unit: z.string().describe('unit symbol, e.g. Nos, Kg, Pcs (must match the item base unit)'),
+                itemLedger: z.string().describe('sales income ledger (Sales) or purchase expense ledger (Purchase) the item value posts to, e.g. "Sales - Inter 18% GST"')
+            })).min(1).describe('one or more stock item lines'),
+            ledgerEntries: z.array(z.object({
+                ledger: z.string().describe('tax / freight / discount ledger name'),
+                amount: z.number().positive().describe('positive amount magnitude'),
+                isDebit: z.boolean().describe('true = debit, false = credit. For Sales output GST is credit (false); for Purchase input GST is debit (true)')
+            })).optional().describe('optional additional ledger lines for taxes, freight, discount, round-off'),
+            narration: z.string().optional().describe('optional narration'),
+            reference: z.string().optional().describe('optional invoice reference / bill number'),
+            voucherNumber: z.string().optional().describe('optional manual voucher number; skip to let Tally auto-number'),
+            remoteId: z.string().optional().describe('optional explicit REMOTEID; skip to auto-generate'),
+            dryRun: z.boolean().optional().describe('defaults to true (preview only). set false to actually write to Tally')
+        },
+        annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const voucherType = args.voucherType || 'Sales';
+            const isSales = voucherType.toLowerCase() !== 'purchase' && !/purchase|debit note/i.test(voucherType);
+            const inv = args.inventoryEntries;
+            const led = (args.ledgerEntries || []);
+            const signOf = (n) => (n < 0 ? 'Yes' : 'No'); // negative amount = debit = deemed positive Yes
+            let itemsSigned = 0;
+            const items = inv.map(it => {
+                const amt = it.quantity * it.rate;
+                const signed = (isSales ? 1 : -1) * amt; // Sales: item credits (+); Purchase: item debits (-)
+                itemsSigned += signed;
+                return { stockItemName: it.stockItemName, qty: it.quantity, rate: it.rate, unit: it.unit, itemLedger: it.itemLedger, deemedPositive: signOf(signed), amountStr: signed.toFixed(2) };
+            });
+            let taxSigned = 0;
+            const taxes = led.map(t => {
+                const signed = (t.isDebit ? -1 : 1) * Math.abs(t.amount);
+                taxSigned += signed;
+                return { ledger: t.ledger, deemedPositive: signOf(signed), amountStr: signed.toFixed(2) };
+            });
+            const partySigned = -(itemsSigned + taxSigned); // balances the voucher
+            const invoiceTotal = Math.abs(partySigned);
+            const remoteId = args.remoteId || ('mcp-' + crypto.randomUUID());
+            let objInput = new Map([
+                ['remoteId', remoteId],
+                ['voucherType', voucherType],
+                ['date', new Date(args.date)],
+                ['partyLedger', args.partyLedger],
+                ['items', items],
+                ['taxes', taxes],
+                ['partyDeemedPositive', signOf(partySigned)],
+                ['partyAmountStr', partySigned.toFixed(2)]
+            ]);
+            if (args.voucherNumber)
+                objInput.set('voucherNumber', args.voucherNumber);
+            if (args.reference)
+                objInput.set('reference', args.reference);
+            if (args.narration)
+                objInput.set('narration', args.narration);
+            if (args.targetCompany)
+                objInput.set('targetCompany', args.targetCompany);
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+                return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, message: `Preview only, nothing written. ${voucherType} invoice, party ${signOf(partySigned) === 'Yes' ? 'debited' : 'credited'} ${invoiceTotal.toFixed(2)}. Set dryRun=false to post. remoteId that will be assigned: ${remoteId}`, remoteId, invoiceTotal, xml: renderPushTemplate('voucher-invoice', objInput) }, null, 2) }] };
+            }
+            const res = await importVouchers('voucher-invoice', objInput);
+            const ok = res.created > 0 && res.errors === 0 && res.exceptions === 0;
+            return { isError: !ok, content: [{ type: 'text', text: JSON.stringify({ dryRun: false, success: ok, remoteId, invoiceTotal, created: res.created, errors: res.errors, exceptions: res.exceptions, lineErrors: res.lineErrors, note: ok ? 'Invoice posted. Store remoteId to delete later.' : 'Posting failed; see lineErrors.' }) }] };
+        }
+        catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };
+        }
+    });
+    mcpServer.registerTool('import-vouchers-excel', {
+        title: 'Import Vouchers from Excel/CSV (write)',
+        description: `WRITE TOOL. Bulk-creates accounting vouchers from an Excel (.xlsx/.xls) or CSV file. Each row is one ledger line; rows sharing the same voucher_id form one voucher. Columns (case/space/underscore-insensitive): voucher_id (required, group key), date (required), voucher_type (required: Journal/Payment/Receipt/Contra/etc), ledger (required), debit, credit, and optional party_ledger, narration, reference, voucher_number. Each voucher must balance (total debit = total credit). Every posted voucher is stamped with a REMOTEID (returned) so it can be deleted later. Handles accounting vouchers only (no inventory; use create-invoice-voucher for stock invoices). dryRun defaults true: it parses and validates the file and returns the vouchers it WOULD post without writing anything. Pass dryRun=false to post. ALWAYS dry-run first and confirm the parsed vouchers with the user before a bulk post to live books.`,
+        inputSchema: {
+            targetCompany: z.string().optional().describe('optional company name. skip for default active company'),
+            filePath: z.string().describe('absolute path to the .xlsx / .xls / .csv file'),
+            sheetName: z.string().optional().describe('optional worksheet name; defaults to the first sheet'),
+            dryRun: z.boolean().optional().describe('defaults to true (parse + validate + preview only). set false to actually post all balanced vouchers')
+        },
+        annotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false
+        }
+    }, async (args) => {
+        try {
+            const parsed = parseVoucherWorkbook(args.filePath, args.sheetName);
+            if (parsed.errors.length && parsed.vouchers.length === 0)
+                return { isError: true, content: [{ type: 'text', text: JSON.stringify({ ok: false, errors: parsed.errors }, null, 2) }] };
+            const balanced = parsed.vouchers.filter(v => v.balanced);
+            const unbalanced = parsed.vouchers.filter(v => !v.balanced).map(v => ({ voucherId: v.voucherId, debit: v.debitTotal, credit: v.creditTotal }));
+            const dryRun = args.dryRun !== false;
+            if (dryRun) {
+                return { content: [{ type: 'text', text: JSON.stringify({ dryRun: true, message: `Parsed ${parsed.vouchers.length} voucher(s): ${balanced.length} balanced, ${unbalanced.length} unbalanced. Set dryRun=false to post the balanced ones. Nothing written yet.`, parseErrors: parsed.errors, unbalanced, vouchers: balanced.map(v => ({ voucherId: v.voucherId, date: v.date, voucherType: v.voucherType, lines: v.entries.length, debitTotal: v.debitTotal, entries: v.entries })) }, null, 2) }] };
+            }
+            const results = [];
+            for (const v of balanced) {
+                const remoteId = 'mcp-' + crypto.randomUUID();
+                const signedEntries = v.entries.map(e => ({ ledger: e.ledger, isDebit: e.isDebit, amount: ((e.isDebit ? -1 : 1) * Math.abs(e.amount)).toFixed(2) }));
+                const objInput = new Map([
+                    ['remoteId', remoteId],
+                    ['voucherType', v.voucherType],
+                    ['date', new Date(v.date)],
+                    ['entries', signedEntries]
+                ]);
+                if (v.voucherNumber)
+                    objInput.set('voucherNumber', v.voucherNumber);
+                if (v.partyLedger)
+                    objInput.set('partyLedger', v.partyLedger);
+                if (v.reference)
+                    objInput.set('reference', v.reference);
+                if (v.narration)
+                    objInput.set('narration', v.narration);
+                if (args.targetCompany)
+                    objInput.set('targetCompany', args.targetCompany);
+                const res = await importVouchers('voucher-create', objInput);
+                const ok = res.created > 0 && res.errors === 0 && res.exceptions === 0;
+                results.push({ voucherId: v.voucherId, remoteId, success: ok, created: res.created, errors: res.errors, lineErrors: res.lineErrors });
+            }
+            const posted = results.filter(r => r.success).length;
+            return { content: [{ type: 'text', text: JSON.stringify({ dryRun: false, posted, failed: results.length - posted, skippedUnbalanced: unbalanced.length, parseErrors: parsed.errors, results }, null, 2) }] };
         }
         catch (err) {
             return { isError: true, content: [{ type: 'text', text: JSON.stringify(err instanceof Error ? err.message : err) }] };

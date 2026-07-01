@@ -26,7 +26,8 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "fast-xml-parser": "^5.8.0",
-    "nunjucks": "^3.2.4"
+    "nunjucks": "^3.2.4",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/emscripten": "^1.41.5",
